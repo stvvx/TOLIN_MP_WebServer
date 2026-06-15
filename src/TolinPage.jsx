@@ -1,661 +1,324 @@
-import { useState, useEffect } from 'react'
-import mqtt from 'mqtt/dist/mqtt.esm'
+import { useEffect, useRef, useState } from 'react'
+import mqtt from 'mqtt'
 
-const BROKER_URL = import.meta.env.VITE_MQTT_URL
-const BASE       = import.meta.env.VITE_MQTT_BASE_TOPIC
-const TOPICS = {
-  ammonia:   `${BASE}/ammonia`,
-  ph:        `${BASE}/ph`,
-  turbidity: `${BASE}/turbidity`,
-  feed:      `${BASE}/feed/command`,
+const MQTT_URL = import.meta.env.VITE_MQTT_URL?.trim() || 'wss://broker.emqx.io:8084/mqtt'
+const MQTT_BASE_TOPIC = import.meta.env.VITE_MQTT_BASE_TOPIC?.trim().replace(/\/+$/, '') || 'group1/mp'
+
+function formatNumber(value, digits = 1) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '-'
+  return Number(value).toFixed(digits)
 }
 
-/* ─── styles ──────────────────────────────────────────────────────────── */
-const css = `
-  .tp {
-    font-family: system-ui, -apple-system, sans-serif;
-    background: #f3f0fe;
-    min-height: 100vh;
-    padding: 1.5rem;
-  }
+function topic(suffix) {
+  return `${MQTT_BASE_TOPIC}/${suffix}`
+}
 
-  /* ── hero ── */
-  .tp-hero {
-    background: #26215C;
-    border-radius: 16px;
-    overflow: hidden;
-    margin-bottom: 1.25rem;
-    position: relative;
-  }
-  .tp-hero__bg {
-    position: absolute;
-    inset: 0;
-    overflow: hidden;
-    pointer-events: none;
-  }
-  .tp-hero__circle {
-    position: absolute;
-    border-radius: 50%;
-  }
-  .tp-hero__circle--1 {
-    width: 340px; height: 340px;
-    background: #3C3489;
-    top: -90px; right: -70px;
-    opacity: 0.6;
-  }
-  .tp-hero__circle--2 {
-    width: 190px; height: 190px;
-    background: #534AB7;
-    bottom: -70px; right: 90px;
-    opacity: 0.5;
-  }
-  .tp-hero__circle--3 {
-    width: 110px; height: 110px;
-    background: #7F77DD;
-    top: 30px; right: 170px;
-    opacity: 0.3;
-  }
-  .tp-hero__inner {
-    position: relative;
-    z-index: 1;
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 1rem;
-    flex-wrap: wrap;
-    padding: 2rem 2rem 1.75rem;
-  }
-  .tp-eyebrow {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: #AFA9EC;
-    font-weight: 500;
-    margin-bottom: 8px;
-  }
-  .tp-eyebrow__dot {
-    width: 5px; height: 5px;
-    border-radius: 50%;
-    background: #7F77DD;
-    flex-shrink: 0;
-  }
-  .tp-hero__title {
-    font-size: 36px;
-    font-weight: 700;
-    color: #fff;
-    letter-spacing: 0.06em;
-    margin: 0 0 6px;
-    line-height: 1.1;
-  }
-  .tp-hero__sub {
-    font-size: 13px;
-    color: #CECBF6;
-    line-height: 1.6;
-    max-width: 320px;
-    margin: 0 0 16px;
-  }
-  .tp-hero__stats {
-    display: flex;
-    gap: 1.5rem;
-    flex-wrap: wrap;
-  }
-  .tp-stat__val {
-    font-size: 20px;
-    font-weight: 700;
-    color: #fff;
-    display: block;
-  }
-  .tp-stat__lbl {
-    font-size: 11px;
-    color: #AFA9EC;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
+const colors = {
+  bg:          '#0C447C',
+  bgDeep:      '#042C53',
+  bgCard:      '#042C53',
+  border:      '#185FA5',
+  accent:      '#378ADD',
+  textPrimary: '#E6F1FB',
+  textMuted:   '#85B7EB',
+  textHint:    '#378ADD',
+  green:       '#9FE1CB',
+  greenBg:     '#085041',
+  greenBorder: '#1D9E75',
+}
 
-  /* ── connection card ── */
-  .tp-conn {
-    background: rgba(255,255,255,0.07);
-    border: 0.5px solid rgba(175,169,236,0.3);
-    border-radius: 12px;
-    padding: 14px 18px;
-    min-width: 210px;
-    align-self: flex-start;
-    flex-shrink: 0;
-  }
-  .tp-conn__header {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    margin-bottom: 8px;
-  }
-  .tp-conn__dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .tp-conn__dot--good    { background: #97C459; animation: tp-pulse 2s infinite; }
-  .tp-conn__dot--warning { background: #EF9F27; }
-  .tp-conn__dot--neutral { background: #F09595; }
-  @keyframes tp-pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.4; }
-  }
-  .tp-conn__label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: #AFA9EC;
-    font-weight: 500;
-  }
-  .tp-conn__value {
-    font-size: 13px;
-    font-weight: 500;
-    color: #fff;
-    margin-bottom: 4px;
-  }
-  .tp-conn__meta {
-    font-size: 11px;
-    color: #8880c0;
-  }
+function StatusBadge({ active, label }) {
+  return (
+    <span style={{
+      fontSize: 10,
+      padding: '2px 8px',
+      borderRadius: 20,
+      background: active ? colors.greenBg   : colors.bg,
+      color:      active ? colors.green      : colors.textMuted,
+      border: `0.5px solid ${active ? colors.greenBorder : colors.border}`,
+      whiteSpace: 'nowrap',
+    }}>
+      {label}
+    </span>
+  )
+}
 
-  /* ── toolbar ── */
-  .tp-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 14px 1.25rem;
-    background: #fff;
-    border: 0.5px solid #dcd8f8;
-    border-radius: 12px;
-    margin-bottom: 1.25rem;
-    flex-wrap: wrap;
-  }
-  .tp-toolbar__left {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .tp-toolbar__icon {
-    width: 36px; height: 36px;
-    border-radius: 8px;
-    background: #EEEDFE;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #534AB7;
-    font-size: 18px;
-    flex-shrink: 0;
-  }
-  .tp-toolbar__name {
-    font-size: 14px;
-    font-weight: 600;
-    color: #26215C;
-    display: block;
-    margin-bottom: 2px;
-  }
-  .tp-toolbar__sub {
-    font-size: 12px;
-    color: #7F77DD;
-  }
-  .tp-feed-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 9px 20px;
-    border-radius: 8px;
-    background: #534AB7;
-    border: none;
-    color: #fff;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    letter-spacing: 0.01em;
-    transition: background 0.15s, transform 0.1s;
-  }
-  .tp-feed-btn:hover:not(:disabled) { background: #7F77DD; }
-  .tp-feed-btn:active:not(:disabled) { transform: scale(0.98); }
-  .tp-feed-btn:disabled { background: #e8e6f8; color: #a09cc8; cursor: not-allowed; }
+function SensorCard({ icon, title, value, unit, detail, stateLabel, active }) {
+  return (
+    <div style={{
+      background: colors.bgCard,
+      border: `0.5px solid ${colors.border}`,
+      borderRadius: 12,
+      padding: '16px',
+    }}>
+      <div style={{
+        display: 'flex', justifyContent: 'space-between',
+        alignItems: 'flex-start', marginBottom: 12,
+      }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 8,
+          background: '#185FA5',
+          display: 'flex', alignItems: 'center',
+          justifyContent: 'center',
+          fontSize: 16, color: colors.textMuted,
+        }}>
+          {icon}
+        </div>
+        <StatusBadge active={active} label={stateLabel} />
+      </div>
+      <div style={{ fontSize: 12, color: colors.textMuted, marginBottom: 2 }}>{title}</div>
+      <div style={{ fontSize: 30, fontWeight: 500, color: colors.textPrimary, marginBottom: 2 }}>
+        {value}
+        {unit && (
+          <span style={{ fontSize: 14, fontWeight: 400, color: colors.textMuted, marginLeft: 2 }}>
+            {unit}
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: colors.textHint }}>{detail}</div>
+    </div>
+  )
+}
 
-  /* ── sensor cards ── */
-  .tp-cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 12px;
-    margin-bottom: 1.25rem;
-  }
-  .tp-card {
-    background: #fff;
-    border: 0.5px solid #dcd8f8;
-    border-radius: 14px;
-    padding: 1.25rem;
-    position: relative;
-    overflow: hidden;
-  }
-  .tp-card__accent {
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 3px;
-    background: #7F77DD;
-    border-radius: 14px 14px 0 0;
-  }
-  .tp-card__top {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    margin-bottom: 14px;
-  }
-  .tp-card__icon {
-    width: 40px; height: 40px;
-    border-radius: 10px;
-    background: #EEEDFE;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #534AB7;
-    font-size: 20px;
-  }
-  .tp-card__badge {
-    font-size: 11px;
-    padding: 3px 9px;
-    border-radius: 999px;
-    background: #EEEDFE;
-    color: #534AB7;
-    font-weight: 500;
-    white-space: nowrap;
-  }
-  .tp-card__badge--active {
-    background: #534AB7;
-    color: #EEEDFE;
-  }
-  .tp-card__title {
-    font-size: 12px;
-    font-weight: 500;
-    color: #8880c0;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-bottom: 6px;
-  }
-  .tp-card__value {
-    font-size: 34px;
-    font-weight: 700;
-    color: #26215C;
-    line-height: 1;
-    margin-bottom: 4px;
-  }
-  .tp-card__unit {
-    font-size: 14px;
-    font-weight: 400;
-    color: #7F77DD;
-    margin-left: 3px;
-  }
-  .tp-card__detail {
-    font-size: 12px;
-    color: #8880c0;
-    margin-bottom: 0;
-  }
-  .tp-card__divider {
-    border: none;
-    border-top: 0.5px solid #EEEDFE;
-    margin: 12px 0;
-  }
-  .tp-card__footer {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: #7F77DD;
-  }
-
-  /* ── bottom grid ── */
-  .tp-bottom {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    margin-bottom: 1.25rem;
-  }
-  @media (max-width: 480px) { .tp-bottom { grid-template-columns: 1fr; } }
-
-  .tp-summary {
-    background: #26215C;
-    border-radius: 14px;
-    padding: 1.25rem;
-  }
-  .tp-summary__label {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: #AFA9EC;
-    font-weight: 500;
-    margin-bottom: 6px;
-  }
-  .tp-summary__text {
-    font-size: 13px;
-    color: #CECBF6;
-    line-height: 1.6;
-    margin: 0;
-  }
-
-  .tp-feed-card {
-    background: #fff;
-    border: 0.5px solid #dcd8f8;
-    border-radius: 14px;
-    padding: 1.25rem;
-  }
-  .tp-feed-card__label {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: #8880c0;
-    font-weight: 500;
-    margin-bottom: 10px;
-  }
-  .tp-feed-card__row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .tp-feed-card__val {
-    font-size: 22px;
-    font-weight: 700;
-    color: #26215C;
-  }
-  .tp-feed-card__icon {
-    width: 36px; height: 36px;
-    border-radius: 8px;
-    background: #EEEDFE;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #534AB7;
-    font-size: 18px;
-  }
-
-  /* ── footer bar ── */
-  .tp-footer {
-    background: #fff;
-    border: 0.5px solid #dcd8f8;
-    border-radius: 12px;
-    padding: 12px 1.25rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    flex-wrap: wrap;
-  }
-  .tp-footer__brand {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .tp-footer__dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: #7F77DD;
-  }
-  .tp-footer__name {
-    font-size: 13px;
-    font-weight: 600;
-    color: #26215C;
-    letter-spacing: 0.04em;
-  }
-  .tp-footer__meta {
-    font-size: 12px;
-    color: #8880c0;
-  }
-  .tp-tags {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
-  .tp-tag {
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    background: #EEEDFE;
-    color: #534AB7;
-    font-weight: 500;
-    border: 0.5px solid #CECBF6;
-  }
-`
-
-export default function TolinPage() {
-  const [brokerStatus, setBrokerStatus] = useState('disconnected')
-  const [esp32Status,  setEsp32Status]  = useState('offline')
-  const [telemetry,    setTelemetry]    = useState({})
-  const [sourceStatus, setSourceStatus] = useState(null)
-  const [lastUpdated,  setLastUpdated]  = useState(null)
-  const [feedState,    setFeedState]    = useState('idle')
-  const [client,       setClient]       = useState(null)
+function TolinPage() {
+  const clientRef = useRef(null)
+  const [brokerStatus, setBrokerStatus] = useState('connecting')
+  const [esp32Status, setEsp32Status]   = useState('unknown')
+  const [status, setStatus]             = useState(null)
+  const [telemetry, setTelemetry]       = useState(null)
+  const [error, setError]               = useState('')
+  const [feedState, setFeedState]       = useState('idle')
+  const [lastUpdated, setLastUpdated]   = useState(null)
 
   useEffect(() => {
-    setBrokerStatus('connecting')
-    const mqttClient = mqtt.connect(BROKER_URL)
-
-    mqttClient.on('connect', () => {
-      setBrokerStatus('connected')
-      mqttClient.subscribe([TOPICS.ammonia, TOPICS.ph, TOPICS.turbidity])
+    const client = mqtt.connect(MQTT_URL, {
+      clean: true,
+      connectTimeout: 5000,
+      clientId: `group1-mp-web-${Math.random().toString(16).slice(2, 10)}`,
+      reconnectPeriod: 3000,
     })
+    clientRef.current = client
 
-    mqttClient.on('message', (topic, message) => {
-      const raw = message.toString()
-      setLastUpdated(new Date())
-      setEsp32Status('online')
-      try {
-        const payload = JSON.parse(raw)
-        if (topic === TOPICS.ammonia) {
-          setSourceStatus(p => ({ ...p, ammonia: { ppm: payload.ppm, threshold: payload.threshold, pumpActive: payload.pumpActive } }))
-          setTelemetry(p => ({ ...p, ammonia: payload.ppm }))
-        }
-        if (topic === TOPICS.ph) {
-          setSourceStatus(p => ({ ...p, ph: { value: payload.value, threshold: payload.threshold, pumpActive: payload.pumpActive } }))
-          setTelemetry(p => ({ ...p, ph: payload.value }))
-        }
-        if (topic === TOPICS.turbidity) {
-          setSourceStatus(p => ({ ...p, turbidity: { ntu: payload.ntu, adc: payload.adc, pumpActive: payload.pumpActive } }))
-          setTelemetry(p => ({ ...p, turbidity: payload.ntu }))
-        }
-      } catch (e) {
-        console.warn('Non-JSON MQTT message:', raw)
+    const subs = [topic('status'), topic('telemetry'), topic('status/availability')]
+
+    client.on('connect', () => {
+      setBrokerStatus('connected')
+      setError('')
+      client.subscribe(subs)
+    })
+    client.on('reconnect', () => setBrokerStatus('connecting'))
+    client.on('close',     () => setBrokerStatus('disconnected'))
+    client.on('error',     (e) => { setBrokerStatus('error'); setError(e?.message || 'MQTT error') })
+
+    client.on('message', (incomingTopic, payload) => {
+      const msg = payload.toString()
+      if (incomingTopic === topic('status')) {
+        try {
+          const data = JSON.parse(msg)
+          setStatus(data)
+          setEsp32Status(data.wifiConnected ? 'online' : 'offline')
+          setLastUpdated(new Date())
+          setError('')
+        } catch { setError('Malformed status payload.') }
+        return
+      }
+      if (incomingTopic === topic('telemetry')) {
+        try { setTelemetry(JSON.parse(msg)); setLastUpdated(new Date()) }
+        catch { setError('Malformed telemetry payload.') }
+        return
+      }
+      if (incomingTopic === topic('status/availability')) {
+        setEsp32Status(msg === 'online' ? 'online' : 'offline')
+        setLastUpdated(new Date())
       }
     })
 
-    mqttClient.on('error',  (err) => { console.error(err); setBrokerStatus('disconnected') })
-    mqttClient.on('close',  ()    => { setBrokerStatus('disconnected'); setEsp32Status('offline') })
-
-    setClient(mqttClient)
-    return () => mqttClient.end()
+    return () => { client.end(true); clientRef.current = null }
   }, [])
 
-  function handleFeedNow() {
-    if (!client || brokerStatus !== 'connected') return
+  const handleFeedNow = () => {
+    const client = clientRef.current
+    if (!client || brokerStatus !== 'connected') {
+      setError('MQTT broker is not connected yet.')
+      return
+    }
     setFeedState('sending')
-    client.publish(TOPICS.feed, JSON.stringify({ command: 'feed', ts: Date.now() }))
-    setTimeout(() => setFeedState('queued'), 500)
-    setTimeout(() => setFeedState('idle'),   3000)
+    client.publish(topic('feed'), '1', { qos: 1, retain: false }, (err) => {
+      if (err) { setFeedState('error'); setError(err.message || 'Publish failed.') }
+      else      { setFeedState('queued'); setError('') }
+      setTimeout(() => setFeedState('idle'), 1500)
+    })
   }
 
-  function fmt(value, digits = 1) {
-    if (value === null || value === undefined || Number.isNaN(value)) return '—'
-    return Number(value).toFixed(digits)
-  }
+  const src = status || telemetry || {}
+  const isOnline = brokerStatus === 'connected' && esp32Status === 'online'
 
-  const connVariant =
-    brokerStatus === 'connected'
-      ? esp32Status === 'online' ? 'good' : 'warning'
-      : brokerStatus === 'connecting' ? 'warning' : 'neutral'
-
-  const connLabel =
-    brokerStatus === 'connected'
-      ? esp32Status === 'online'
-        ? 'ESP32 online via MQTT'
-        : 'Broker connected, waiting for ESP32'
-      : brokerStatus === 'connecting'
-        ? 'Connecting to MQTT broker…'
-        : 'MQTT disconnected'
-
-  const cards = [
-    {
-      key: 'ammonia',
-      icon: 'ti-flask',
-      title: 'Ammonia',
-      value: fmt(sourceStatus?.ammonia?.ppm ?? telemetry?.ammonia, 2),
-      unit: 'ppm',
-      detail: `Threshold ${fmt(sourceStatus?.ammonia?.threshold, 2)} ppm`,
-      badge: sourceStatus?.ammonia?.pumpActive ? 'Air pump ON' : 'Air pump OFF',
-      active: !!sourceStatus?.ammonia?.pumpActive,
-    },
-    {
-      key: 'ph',
-      icon: 'ti-test-pipe',
-      title: 'pH sensor',
-      value: fmt(sourceStatus?.ph?.value ?? telemetry?.ph, 2),
-      unit: '',
-      detail: `Threshold ${fmt(sourceStatus?.ph?.threshold, 2)}`,
-      badge: sourceStatus?.ph?.pumpActive ? 'Acid pump ON' : 'Pump OFF',
-      active: !!sourceStatus?.ph?.pumpActive,
-    },
-    {
-      key: 'turbidity',
-      icon: 'ti-waves',
-      title: 'Turbidity',
-      value: sourceStatus?.turbidity?.ntu ?? telemetry?.turbidity ?? '—',
-      unit: 'NTU',
-      detail: `ADC ${sourceStatus?.turbidity?.adc ?? '—'}`,
-      badge: sourceStatus?.turbidity?.pumpActive ? 'Pump ON' : 'Pump OFF',
-      active: !!sourceStatus?.turbidity?.pumpActive,
-    },
-  ]
+  const connectionLabel = brokerStatus === 'connected'
+    ? esp32Status === 'online'
+      ? `ESP32 online via MQTT${status?.ip ? ` (${status.ip})` : ''}`
+      : 'Broker connected, waiting for ESP32…'
+    : brokerStatus === 'connecting'
+      ? 'Connecting to MQTT broker…'
+      : 'MQTT disconnected'
 
   const feedLabel =
-    feedState === 'queued'  ? 'Queued' :
-    feedState === 'sending' ? 'Sending…' :
-    feedState === 'error'   ? 'Failed' : 'Idle'
-
-  const summaryText =
-    brokerStatus === 'connected'
-      ? esp32Status === 'online'
-        ? 'ESP32 is publishing live MQTT updates to Tolin station.'
-        : 'Broker connected — waiting for ESP32 to publish data.'
-      : 'Waiting for MQTT broker connection.'
+    feedState === 'sending' ? 'Queuing…' :
+    feedState === 'queued'  ? 'Queued ✓' : 'Feed now'
 
   return (
-    <>
-      <style>{css}</style>
-      <div className="tp">
+    <div style={{ background: colors.bg, minHeight: '100vh', fontFamily: 'sans-serif' }}>
 
-        {/* Hero */}
-        <section className="tp-hero">
-          <div className="tp-hero__bg">
-            <div className="tp-hero__circle tp-hero__circle--1" />
-            <div className="tp-hero__circle tp-hero__circle--2" />
-            <div className="tp-hero__circle tp-hero__circle--3" />
-          </div>
-          <div className="tp-hero__inner">
-            <div>
-              <div className="tp-eyebrow"><span className="tp-eyebrow__dot" />Station monitoring</div>
-              <h1 className="tp-hero__title">TOLIN</h1>
-              <p className="tp-hero__sub">
-                Live sensor feed for ammonia, pH, and turbidity at the Tolin aquaculture station.
-              </p>
-              <div className="tp-hero__stats">
-                <div><span className="tp-stat__val">3</span><span className="tp-stat__lbl">Sensors</span></div>
-                <div><span className="tp-stat__val">{lastUpdated ? lastUpdated.toLocaleTimeString() : '—'}</span><span className="tp-stat__lbl">Last ping</span></div>
-                <div><span className="tp-stat__val">MQTT</span><span className="tp-stat__lbl">Protocol</span></div>
-              </div>
-            </div>
-            <div className="tp-conn">
-              <div className="tp-conn__header">
-                <span className={`tp-conn__dot tp-conn__dot--${connVariant}`} />
-                <span className="tp-conn__label">Connection</span>
-              </div>
-              <div className="tp-conn__value">{connLabel}</div>
-              <div className="tp-conn__meta">
-                {lastUpdated ? `Last update ${lastUpdated.toLocaleTimeString()}` : 'Waiting for first reading'}
-              </div>
-            </div>
-          </div>
-        </section>
+      {/* ── Top bar ── */}
+      <div style={{
+        background: colors.bgDeep,
+        borderBottom: `0.5px solid ${colors.border}`,
+        padding: '14px 24px',
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+      }}>
+        <span style={{ fontSize: 15, fontWeight: 500, color: colors.textPrimary }}>
+          AquaControl
+        </span>
+        <span style={{
+          fontSize: 11, padding: '3px 10px', borderRadius: 20,
+          background: '#185FA5', color: colors.textMuted,
+          border: `0.5px solid ${colors.accent}`,
+          display: 'flex', alignItems: 'center', gap: 5,
+        }}>
+          <span style={{
+            width: 7, height: 7, borderRadius: '50%',
+            background: isOnline ? '#5DCAA5' : '#EF9F27',
+            display: 'inline-block',
+          }} />
+          {isOnline ? 'ESP32 online' : 'Waiting for ESP32'}
+        </span>
+      </div>
 
-        {/* Toolbar */}
-        <div className="tp-toolbar">
-          <div className="tp-toolbar__left">
-            <div className="tp-toolbar__icon"><i className="ti ti-antenna" aria-hidden="true" /></div>
-            <div>
-              <span className="tp-toolbar__name">Tolin Station</span>
-              <span className="tp-toolbar__sub">Ammonia · pH sensor · Turbidity monitoring</span>
-            </div>
-          </div>
-          <button
-            className="tp-feed-btn"
-            type="button"
-            onClick={handleFeedNow}
-            disabled={brokerStatus !== 'connected' || feedState === 'sending'}
-          >
-            <i className="ti ti-fish" aria-hidden="true" />
-            {feedState === 'sending' ? 'Queuing…' : 'Feed now'}
-          </button>
+      {/* ── Main content ── */}
+      <div style={{ maxWidth: 760, margin: '0 auto', padding: '24px 20px' }}>
+
+        {/* Header */}
+        <div style={{ marginBottom: 20 }}>
+          <h1 style={{ fontSize: 18, fontWeight: 500, color: colors.textPrimary, margin: '0 0 4px' }}>
+            Water quality monitor
+          </h1>
+          <p style={{ fontSize: 13, color: colors.textMuted, margin: 0 }}>
+            Ammonia · pH · Turbidity — live MQTT readings
+          </p>
         </div>
 
-        {/* Sensor Cards */}
-        <div className="tp-cards">
-          {cards.map(card => (
-            <article className="tp-card" key={card.key}>
-              <div className="tp-card__accent" />
-              <div className="tp-card__top">
-                <div className="tp-card__icon"><i className={`ti ${card.icon}`} aria-hidden="true" /></div>
-                <span className={`tp-card__badge${card.active ? ' tp-card__badge--active' : ''}`}>{card.badge}</span>
-              </div>
-              <div className="tp-card__title">{card.title}</div>
-              <div className="tp-card__value">
-                {card.value}
-                {card.unit && <span className="tp-card__unit">{card.unit}</span>}
-              </div>
-              <p className="tp-card__detail">{card.detail}</p>
-              <hr className="tp-card__divider" />
-              <div className="tp-card__footer">
-                <i className="ti ti-clock" style={{ fontSize: 13 }} aria-hidden="true" />
-                {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : 'Awaiting data'}
-              </div>
-            </article>
-          ))}
+        {/* Connection row */}
+        <div style={{
+          background: colors.bgDeep,
+          border: `0.5px solid ${colors.border}`,
+          borderRadius: 8, padding: '10px 14px',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          marginBottom: 20, fontSize: 12,
+        }}>
+          <span style={{ color: colors.textMuted, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{
+              width: 7, height: 7, borderRadius: '50%',
+              background: isOnline ? '#5DCAA5' : '#EF9F27',
+              display: 'inline-block',
+            }} />
+            Connection
+          </span>
+          <span style={{ fontWeight: 500, color: isOnline ? colors.green : '#EF9F27' }}>
+            {connectionLabel}
+          </span>
         </div>
 
-        {/* Bottom grid */}
-        <div className="tp-bottom">
-          <div className="tp-summary">
-            <div className="tp-summary__label">Live summary</div>
-            <p className="tp-summary__text">{summaryText}</p>
+        {/* Error */}
+        {error && (
+          <div style={{
+            background: '#1a0a0a',
+            border: '0.5px solid #7F1D1D',
+            borderRadius: 8, padding: '10px 14px', marginBottom: 16,
+            fontSize: 12, color: '#FCA5A5',
+          }}>
+            {error}
           </div>
-          <div className="tp-feed-card">
-            <div className="tp-feed-card__label">Feed action</div>
-            <div className="tp-feed-card__row">
-              <div className="tp-feed-card__val">{feedLabel}</div>
-              <div className="tp-feed-card__icon">
-                <i className="ti ti-player-play" aria-hidden="true" />
-              </div>
-            </div>
-          </div>
+        )}
+
+        {/* ── Sensor cards ── */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+          gap: 12,
+          marginBottom: 20,
+        }}>
+          <SensorCard
+            icon="⚗"
+            title="Ammonia"
+            value={formatNumber(src?.ammonia?.ppm ?? telemetry?.ammonia, 2)}
+            unit="ppm"
+            detail={`Threshold ${formatNumber(src?.ammonia?.threshold, 2)} ppm`}
+            stateLabel={src?.ammonia?.pumpActive ? 'Air pump ON' : 'Air pump OFF'}
+            active={!!src?.ammonia?.pumpActive}
+          />
+          <SensorCard
+            icon="〜"
+            title="pH"
+            value={formatNumber(src?.ph?.value ?? telemetry?.ph, 2)}
+            unit=""
+            detail={`Threshold ${formatNumber(src?.ph?.threshold, 2)}`}
+            stateLabel={src?.ph?.pumpActive ? 'Acid pump ON' : 'Pump OFF'}
+            active={!!src?.ph?.pumpActive}
+          />
+          <SensorCard
+            icon="≋"
+            title="Turbidity"
+            value={src?.turbidity?.ntu ?? telemetry?.turbidity ?? '-'}
+            unit="NTU"
+            detail={`ADC ${src?.turbidity?.adc ?? '-'}`}
+            stateLabel={src?.turbidity?.pumpActive ? 'Pump ON' : 'Pump OFF'}
+            active={!!src?.turbidity?.pumpActive}
+          />
         </div>
 
-        {/* Footer */}
-        <div className="tp-footer">
-          <div className="tp-footer__brand">
-            <span className="tp-footer__dot" />
-            <span className="tp-footer__name">TOLIN</span>
-            <span className="tp-footer__meta">Aquaculture Monitoring System</span>
-          </div>
-          <div className="tp-tags">
-            {['MQTT', 'ESP32', 'Ammonia', 'pH', 'Turbidity'].map(t => (
-              <span className="tp-tag" key={t}>{t}</span>
-            ))}
+        {/* ── Toolbar ── */}
+        <div style={{
+          background: colors.bgDeep,
+          border: `0.5px solid ${colors.border}`,
+          borderRadius: 8, padding: '10px 14px',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          fontSize: 12,
+        }}>
+          <span style={{ color: colors.textMuted }}>
+            {lastUpdated
+              ? `Last update ${lastUpdated.toLocaleTimeString()}`
+              : 'Waiting for first reading…'}
+          </span>
+          <div>
+            <button
+              onClick={() => clientRef.current?.reconnect()}
+              style={{
+                fontSize: 12, padding: '6px 12px', borderRadius: 6,
+                border: `0.5px solid ${colors.accent}`,
+                background: 'transparent', color: colors.textMuted,
+                cursor: 'pointer', marginRight: 8,
+              }}
+            >
+              Reconnect
+            </button>
+            <button
+              onClick={handleFeedNow}
+              disabled={brokerStatus !== 'connected' || feedState === 'sending'}
+              style={{
+                fontSize: 12, padding: '6px 12px', borderRadius: 6,
+                border: `0.5px solid ${colors.greenBorder}`,
+                background: colors.greenBg, color: colors.green,
+                cursor: 'pointer',
+                opacity: brokerStatus !== 'connected' ? 0.5 : 1,
+              }}
+            >
+              {feedLabel}
+            </button>
           </div>
         </div>
 
       </div>
-    </>
+    </div>
   )
 }
+
+export default TolinPage
